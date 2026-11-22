@@ -1,3 +1,5 @@
+> **This is the `orbiters` branch of the Orbiters fork.** It gives `wineobelisk.drv` the keyboard layout selected on the Mac (`dlls/wineobelisk.drv/keymap.c`): virtual keys, `ToUnicodeEx`, AltGr and dead keys, from what the `orbiters` branch of [Orbiters-cc/voile-lkd](https://github.com/Orbiters-cc/voile-lkd)'s wsd sends. `main` mirrors [Zagrios/voile-wine](https://github.com/Zagrios/voile-wine). The changes are not voile-wine's authors' work: do not report their problems to them.
+
 ## INTRODUCTION
 
 Wine is a program which allows running Microsoft Windows programs

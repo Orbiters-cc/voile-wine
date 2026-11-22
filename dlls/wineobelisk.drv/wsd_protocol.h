@@ -80,6 +80,8 @@ enum {
   WSD_EV_ZOOM = 116,       /* wsd_window: the user pressed the zoom (green) button */
   WSD_EV_DISPLAY = 117,    /* wsd_hello_reply: the main screen changed (size, scale, refresh rate or work area) */
   WSD_EV_APP_DEACTIVATED = 118, /* no payload: another app became the active one (Cmd-Tab, a click, a link opened) */
+  /* Orbiters fork, numbered away from the sequence above so that a number upstream gives later never means this */
+  WSD_EV_KEYMAP = 1001,    /* wsd_ev_keymap + bytes of a struct wsd_keymap blob: the Mac's keyboard layout */
 };
 
 enum { WSD_FMT_BGRA8 = 1, WSD_FMT_RGBA8 = 2, WSD_FMT_RGB10A2 = 3 };
@@ -151,7 +153,9 @@ struct wsd_present {
 struct wsd_ping { uint64_t token; uint64_t time_ns; };
 struct wsd_debug_input {
   uint32_t kind;   /* 1 key (a = mac keycode, b = 1 down / 0 up), 2 left click at window pixels (a, b),
-                      3 raw motion, 4 window action as the user does it (a = WSD_DEBUG_WINDOW_*) */
+                      3 raw motion, 4 window action as the user does it (a = WSD_DEBUG_WINDOW_*),
+                      5 pointer motion at view pixels (a, b), without activating anything,
+                      6 like 5, where CURSOR_WARP to screen pixels (a, b) puts the pointer, without moving it */
   uint32_t a, b;
   uint32_t reserved; /* kind 4: second coordinate */
 };
@@ -222,6 +226,44 @@ struct wsd_ev_key {
   uint32_t modifiers;
   uint64_t time_ns;
 };
+/* WSD_EV_KEYMAP: what each key types in the keyboard layout selected on the Mac, for the client to build the Windows
+ * layout from (virtual keys, ToUnicodeEx, dead keys). Sent after EV_HELLO, and again when the input source or the
+ * keyboard's type changes. The blob is larger than a message: it comes in pieces, in order, each with its offset in
+ * the blob; the piece that ends at `total` completes it. A new serial replaces a blob not completed. */
+struct wsd_ev_keymap {
+  uint32_t serial; /* counts the layouts sent by this server */
+  uint32_t offset; /* of this piece in the blob */
+  uint32_t total;  /* size of the blob */
+};
+#define WSD_KEYMAP_VERSION 1u
+#define WSD_KEYMAP_KEYS 128u /* mac virtual keycodes 0..127 */
+/* the modifiers a key was translated with (UCKeyTranslate), one column of the blob's characters per level */
+enum {
+  WSD_KEYMAP_BASE = 0,
+  WSD_KEYMAP_SHIFT = 1,       /* bit 0 */
+  WSD_KEYMAP_OPTION = 2,      /* bit 1 */
+  WSD_KEYMAP_CAPS = 4,        /* bit 2: levels 0..7 are every combination of the three */
+  WSD_KEYMAP_COMMAND = 8,     /* Command alone */
+  WSD_KEYMAP_COMMAND_SHIFT = 9,
+  WSD_KEYMAP_LEVELS = 10,
+};
+enum { WSD_KEYMAP_ISO = 1u << 0 /* the keyboard is an ISO one */ };
+/* The blob: this header, then
+ *   uint16_t chars[keys][levels]   the UTF-16 unit the key types at that level, 0 for none or for more than one unit;
+ *                                  for a dead key, the character it stands for (the accent alone)
+ *   uint16_t dead[keys]            bit n: the key is a dead key at level n
+ *   struct wsd_keymap_composition compositions[compositions] */
+struct wsd_keymap {
+  uint32_t version;       /* WSD_KEYMAP_VERSION */
+  uint32_t flags;         /* WSD_KEYMAP_ISO */
+  uint32_t keyboard_type; /* the Mac's keyboard type the layout was read for (LMGetKbdType) */
+  uint32_t keys;          /* WSD_KEYMAP_KEYS */
+  uint32_t levels;        /* WSD_KEYMAP_LEVELS */
+  uint32_t compositions;
+  char source[64];        /* the input source's id, such as com.apple.keylayout.French; NUL-terminated */
+};
+/* after the dead key that stands for `dead`, the key that alone types `base` types `composed` */
+struct wsd_keymap_composition { uint16_t dead, base, composed; };
 struct wsd_ev_button {
   uint32_t window_id;
   uint32_t button; /* 0 left, 1 right, 2 middle, 3.. others */
@@ -269,6 +311,9 @@ WSD_ASSERT_SIZE(wsd_audio_ring, 64);
 WSD_ASSERT_SIZE(wsd_audio_open, 40);
 WSD_ASSERT_SIZE(wsd_app_icon, 32);
 WSD_ASSERT_SIZE(wsd_ev_key, 24);
+WSD_ASSERT_SIZE(wsd_ev_keymap, 12);
+WSD_ASSERT_SIZE(wsd_keymap, 88);
+WSD_ASSERT_SIZE(wsd_keymap_composition, 6);
 WSD_ASSERT_SIZE(wsd_ev_button, 32);
 WSD_ASSERT_SIZE(wsd_ev_motion, 24);
 WSD_ASSERT_SIZE(wsd_ev_presented, 56);

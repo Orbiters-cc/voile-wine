@@ -52,8 +52,10 @@
 #include "ntuser.h"
 #include "wine/gdi_driver.h"
 #include "wine/debug.h"
+#include "kbd.h"
 #include "unixlib.h"
 #include "wsd_protocol.h"
+#include "keymap.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(obelisk);
 
@@ -1069,60 +1071,514 @@ static LONG OBELISK_ChangeDisplaySettings( LPDEVMODEW displays, LPCWSTR primary_
 }
 
 /***********************************************************************
+ *           keyboard layout
+ *
+ * wsd tells what each key types in the keyboard layout selected on the Mac (WSD_EV_KEYMAP), and keymap.c makes the
+ * Windows layout of it: a key is sent with the virtual key the layout gives it, win32u reads the layout's tables
+ * for MapVirtualKey, VkKeyScan and GetKeyNameText, and ToUnicodeEx types the layout's characters, dead keys
+ * included. Until wsd tells (an older wsd never does), the keys are those of a US keyboard, as before.
+ */
+struct obelisk_layout
+{
+    LONG                   ref;
+    struct obelisk_keymap *keymap;
+    KBDTABLES              tables;
+    ULONG_PTR              modifiers[4];  /* a MODIFIERS and its 8 numbers */
+    VK_TO_BIT              vk_to_bit[4];
+    VK_TO_WCHAR_TABLE      vk_to_wchar_table[2];
+    VK_TO_WCHARS8          vk_to_wchars[OBELISK_KEYS + 32];
+    USHORT                 vsc_to_vk[0x80];
+    VSC_VK                 vsc_to_vk_e0[64];
+    VSC_VK                 vsc_to_vk_e1[2];
+    VSC_LPWSTR             key_names[64];
+    VSC_LPWSTR             key_names_ext[32];
+    WCHAR                  names[1024];
+};
+
+static pthread_mutex_t layout_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct obelisk_layout *current_layout;  /* layout_lock held */
+static BOOL altgr_control;  /* event thread: the left Control of AltGr is down */
+
+/* win32u's US tables (input.c), which the layout's own keys replace */
+static const USHORT us_vsc_to_vk[] =
+{
+    T00, T01, T02, T03, T04, T05, T06, T07,
+    T08, T09, T0A, T0B, T0C, T0D, T0E, T0F,
+    T10, T11, T12, T13, T14, T15, T16, T17,
+    T18, T19, T1A, T1B, T1C, T1D, T1E, T1F,
+    T20, T21, T22, T23, T24, T25, T26, T27,
+    T28, T29, T2A, T2B, T2C, T2D, T2E, T2F,
+    T30, T31, T32, T33, T34, T35, T36 | KBDEXT, T37 | KBDMULTIVK,
+    T38, T39, T3A, T3B, T3C, T3D, T3E, T3F,
+    T40, T41, T42, T43, T44, T45 | KBDEXT | KBDMULTIVK, T46 | KBDMULTIVK, T47 | KBDNUMPAD | KBDSPECIAL,
+    T48 | KBDNUMPAD | KBDSPECIAL, T49 | KBDNUMPAD | KBDSPECIAL, T4A, T4B | KBDNUMPAD | KBDSPECIAL,
+    T4C | KBDNUMPAD | KBDSPECIAL, T4D | KBDNUMPAD | KBDSPECIAL, T4E, T4F | KBDNUMPAD | KBDSPECIAL,
+    T50 | KBDNUMPAD | KBDSPECIAL, T51 | KBDNUMPAD | KBDSPECIAL, T52 | KBDNUMPAD | KBDSPECIAL,
+    T53 | KBDNUMPAD | KBDSPECIAL, T54, T55, T56, T57,
+    T58, T59, T5A, T5B, T5C, T5D, T5E, T5F,
+    T60, T61, T62, T63, T64, T65, T66, T67,
+    T68, T69, T6A, T6B, T6C, T6D, T6E, T6F,
+    T70, T71, T72, T73, T74, T75, T76, T77,
+    T78, T79, T7A, T7B, T7C, T7D, T7E
+};
+
+static const VSC_VK us_vsc_to_vk_e0[] =
+{
+    {0x10, X10 | KBDEXT},
+    {0x19, X19 | KBDEXT},
+    {0x1d, X1D | KBDEXT},
+    {0x20, X20 | KBDEXT},
+    {0x21, X21 | KBDEXT},
+    {0x22, X22 | KBDEXT},
+    {0x24, X24 | KBDEXT},
+    {0x2e, X2E | KBDEXT},
+    {0x30, X30 | KBDEXT},
+    {0x32, X32 | KBDEXT},
+    {0x35, X35 | KBDEXT},
+    {0x37, X37 | KBDEXT},
+    {0x38, X38 | KBDEXT},
+    {0x47, X47 | KBDEXT},
+    {0x48, X48 | KBDEXT},
+    {0x49, X49 | KBDEXT},
+    {0x4b, X4B | KBDEXT},
+    {0x4d, X4D | KBDEXT},
+    {0x4f, X4F | KBDEXT},
+    {0x50, X50 | KBDEXT},
+    {0x51, X51 | KBDEXT},
+    {0x52, X52 | KBDEXT},
+    {0x53, X53 | KBDEXT},
+    {0x5b, X5B | KBDEXT},
+    {0x5c, X5C | KBDEXT},
+    {0x5d, X5D | KBDEXT},
+    {0x5f, X5F | KBDEXT},
+    {0x65, X65 | KBDEXT},
+    {0x66, X66 | KBDEXT},
+    {0x67, X67 | KBDEXT},
+    {0x68, X68 | KBDEXT},
+    {0x69, X69 | KBDEXT},
+    {0x6a, X6A | KBDEXT},
+    {0x6b, X6B | KBDEXT},
+    {0x6c, X6C | KBDEXT},
+    {0x6d, X6D | KBDEXT},
+    {0x1c, X1C | KBDEXT},
+    {0x46, X46 | KBDEXT},
+    {0},
+};
+
+static const VSC_VK us_vsc_to_vk_e1[] =
+{
+    {0x1d, Y1D},
+    {0},
+};
+
+static const struct { BYTE vsc; const char *name; } us_key_names[] =
+{
+    { 0x01, "Esc" },
+    { 0x0e, "Backspace" },
+    { 0x0f, "Tab" },
+    { 0x1c, "Enter" },
+    { 0x1d, "Ctrl" },
+    { 0x2a, "Shift" },
+    { 0x36, "Right Shift" },
+    { 0x37, "Num *" },
+    { 0x38, "Alt" },
+    { 0x39, "Space" },
+    { 0x3a, "Caps Lock" },
+    { 0x3b, "F1" },
+    { 0x3c, "F2" },
+    { 0x3d, "F3" },
+    { 0x3e, "F4" },
+    { 0x3f, "F5" },
+    { 0x40, "F6" },
+    { 0x41, "F7" },
+    { 0x42, "F8" },
+    { 0x43, "F9" },
+    { 0x44, "F10" },
+    { 0x45, "Pause" },
+    { 0x46, "Scroll Lock" },
+    { 0x47, "Num 7" },
+    { 0x48, "Num 8" },
+    { 0x49, "Num 9" },
+    { 0x4a, "Num -" },
+    { 0x4b, "Num 4" },
+    { 0x4c, "Num 5" },
+    { 0x4d, "Num 6" },
+    { 0x4e, "Num +" },
+    { 0x4f, "Num 1" },
+    { 0x50, "Num 2" },
+    { 0x51, "Num 3" },
+    { 0x52, "Num 0" },
+    { 0x53, "Num Del" },
+    { 0x54, "Sys Req" },
+    { 0x57, "F11" },
+    { 0x58, "F12" },
+    { 0x7c, "F13" },
+    { 0x7d, "F14" },
+    { 0x7e, "F15" },
+    { 0x7f, "F16" },
+    { 0x80, "F17" },
+    { 0x81, "F18" },
+    { 0x82, "F19" },
+    { 0x83, "F20" },
+    { 0x84, "F21" },
+    { 0x85, "F22" },
+    { 0x86, "F23" },
+    { 0x87, "F24" },
+};
+
+static const struct { BYTE vsc; const char *name; } us_key_names_ext[] =
+{
+    { 0x1c, "Num Enter" },
+    { 0x1d, "Right Ctrl" },
+    { 0x35, "Num /" },
+    { 0x37, "Prnt Scrn" },
+    { 0x38, "Right Alt" },
+    { 0x45, "Num Lock" },
+    { 0x46, "Break" },
+    { 0x47, "Home" },
+    { 0x48, "Up" },
+    { 0x49, "Page Up" },
+    { 0x4b, "Left" },
+    { 0x4d, "Right" },
+    { 0x4f, "End" },
+    { 0x50, "Down" },
+    { 0x51, "Page Down" },
+    { 0x52, "Insert" },
+    { 0x53, "Delete" },
+    { 0x54, "<00>" },
+    { 0x56, "Help" },
+    { 0x5b, "Left Windows" },
+    { 0x5c, "Right Windows" },
+    { 0x5d, "Application" },
+};
+
+static struct obelisk_layout *grab_layout(void)
+{
+    struct obelisk_layout *layout;
+
+    pthread_mutex_lock( &layout_lock );
+    if ((layout = current_layout)) layout->ref++;
+    pthread_mutex_unlock( &layout_lock );
+    return layout;
+}
+
+static void release_layout( struct obelisk_layout *layout )
+{
+    LONG ref;
+
+    pthread_mutex_lock( &layout_lock );
+    ref = --layout->ref;
+    pthread_mutex_unlock( &layout_lock );
+    if (ref) return;
+    free( layout->keymap );
+    free( layout );
+}
+
+static WCHAR table_char( WCHAR c )
+{
+    return c ? c : WCH_NONE;
+}
+
+/* One line of the layout's table: the characters of a virtual key by modifier bits (Shift 1, Ctrl 2, Alt 4). Alt
+ * alone types what the key types without it (WM_SYSCHAR), Ctrl+Alt is AltGr, and Ctrl alone is win32u's business. */
+static void add_wchars( VK_TO_WCHARS8 **entry, BYTE vkey, WCHAR plain, WCHAR shift, WCHAR altgr, WCHAR shift_altgr,
+                        BYTE attributes )
+{
+    VK_TO_WCHARS8 line = { .VirtualKey = vkey, .Attributes = attributes };
+
+    line.wch[0] = line.wch[KBDALT] = table_char( plain );
+    line.wch[KBDSHIFT] = line.wch[KBDALT | KBDSHIFT] = table_char( shift );
+    line.wch[KBDCTRL] = line.wch[KBDCTRL | KBDSHIFT] = WCH_NONE;
+    line.wch[KBDCTRL | KBDALT] = table_char( altgr );
+    line.wch[KBDCTRL | KBDALT | KBDSHIFT] = table_char( shift_altgr );
+    *(*entry)++ = line;
+}
+
+/* The KBDTABLES of a layout: win32u's US tables, where the character keys have the layout's virtual keys and
+ * characters. */
+static struct obelisk_layout *create_layout( struct obelisk_keymap *keymap )
+{
+    static const struct { BYTE vkey; WCHAR c; } same_everywhere[] =
+    {
+        { VK_TAB, '\t' }, { VK_BACK, '\b' }, { VK_ESCAPE, 0x1b }, { VK_RETURN, '\r' }, { VK_CANCEL, 3 },
+        { VK_ADD, '+' }, { VK_DIVIDE, '/' }, { VK_MULTIPLY, '*' }, { VK_SUBTRACT, '-' },
+    };
+    struct obelisk_layout *layout;
+    VK_TO_WCHARS8 *wchars;
+    VSC_LPWSTR *name;
+    VSC_VK *e0;
+    WCHAR *text;
+    MODIFIERS *modifiers;
+    UINT key, i, mod;
+
+    if (!(layout = calloc( 1, sizeof(*layout) ))) return NULL;
+    C_ASSERT( sizeof(layout->modifiers) >= offsetof( MODIFIERS, ModNumber[8] ) );
+    modifiers = (MODIFIERS *)layout->modifiers;
+    layout->ref = 1;
+    layout->keymap = keymap;
+
+    layout->vk_to_bit[0].Vk = VK_SHIFT;
+    layout->vk_to_bit[0].ModBits = KBDSHIFT;
+    layout->vk_to_bit[1].Vk = VK_CONTROL;
+    layout->vk_to_bit[1].ModBits = KBDCTRL;
+    layout->vk_to_bit[2].Vk = VK_MENU;
+    layout->vk_to_bit[2].ModBits = KBDALT;
+    modifiers->pVkToBit = layout->vk_to_bit;
+    modifiers->wMaxModBits = 7;
+    for (mod = 0; mod < 8; mod++) modifiers->ModNumber[mod] = mod;
+
+    /* scan code -> virtual key */
+    C_ASSERT( sizeof(layout->vsc_to_vk) >= sizeof(us_vsc_to_vk) );
+    C_ASSERT( sizeof(layout->vsc_to_vk_e0) >= sizeof(us_vsc_to_vk_e0) + 8 * sizeof(VSC_VK) );
+    memcpy( layout->vsc_to_vk, us_vsc_to_vk, sizeof(us_vsc_to_vk) );
+    memcpy( layout->vsc_to_vk_e0, us_vsc_to_vk_e0, sizeof(us_vsc_to_vk_e0) );
+    memcpy( layout->vsc_to_vk_e1, us_vsc_to_vk_e1, sizeof(us_vsc_to_vk_e1) );
+    e0 = layout->vsc_to_vk_e0 + ARRAY_SIZE(us_vsc_to_vk_e0) - 1;  /* its end mark */
+    for (key = 0; key < OBELISK_KEYS; key++)
+    {
+        WORD scan = keymap->scan[key], vkey = keymap->vkey[key];
+        if (keymap->key_of_vkey[vkey & 0xff] != key || vkey == VK_SPACE) continue;
+        if (!(scan & 0xff)) continue;
+        if (!(scan & 0x100)) layout->vsc_to_vk[scan & 0x7f] = vkey;
+        else if (e0 < layout->vsc_to_vk_e0 + ARRAY_SIZE(layout->vsc_to_vk_e0) - 1)
+        {
+            e0->Vsc = scan & 0xff;
+            e0->Vk = vkey | KBDEXT;
+            e0++;
+        }
+    }
+
+    /* virtual key -> characters */
+    wchars = layout->vk_to_wchars;
+    for (key = 0; key < OBELISK_KEYS; key++)
+    {
+        const WCHAR *c = keymap->chars[key];
+        WORD vkey = keymap->vkey[key];
+        BYTE attributes = 0;
+        if (keymap->key_of_vkey[vkey & 0xff] != key) continue;
+        if (!c[0] && !c[1] && !c[2] && !c[3]) continue;
+        /* Caps Lock types what Shift types */
+        if (c[OBELISK_LEVEL_CAPS] && c[OBELISK_LEVEL_CAPS] == c[OBELISK_LEVEL_SHIFT] && c[OBELISK_LEVEL_SHIFT] != c[0])
+            attributes = CAPLOK;
+        add_wchars( &wchars, vkey, c[0], c[OBELISK_LEVEL_SHIFT], keymap->altgr ? c[OBELISK_LEVEL_ALTGR] : 0,
+                    keymap->altgr ? c[OBELISK_LEVEL_ALTGR | OBELISK_LEVEL_SHIFT] : 0, attributes );
+    }
+    if (keymap->key_of_vkey[VK_SPACE] == 0xff) add_wchars( &wchars, VK_SPACE, ' ', ' ', 0, 0, 0 );
+    for (i = 0; i < ARRAY_SIZE(same_everywhere); i++)
+        add_wchars( &wchars, same_everywhere[i].vkey, same_everywhere[i].c, same_everywhere[i].c, 0, 0, 0 );
+    /* the keypad's decimal key: a comma in the layouts that count with one */
+    key = keymap->chars[0x41][0] ? keymap->chars[0x41][0] : '.';
+    add_wchars( &wchars, VK_DECIMAL, key, key, 0, 0, 0 );
+    for (i = 0; i < 10; i++) add_wchars( &wchars, VK_NUMPAD0 + i, '0' + i, 0, 0, 0, 0 );
+    layout->vk_to_wchar_table[0].pVkToWchars = (VK_TO_WCHARS1 *)layout->vk_to_wchars;
+    layout->vk_to_wchar_table[0].nModifications = 8;
+    layout->vk_to_wchar_table[0].cbSize = sizeof(layout->vk_to_wchars[0]);
+
+    /* key names: the US ones; a character key is named by win32u after what it types */
+    text = layout->names;
+    name = layout->key_names;
+    for (i = 0; i < ARRAY_SIZE(us_key_names); i++, name++)
+    {
+        const char *p = us_key_names[i].name;
+        name->vsc = us_key_names[i].vsc;
+        name->pwsz = text;
+        while ((*text++ = (unsigned char)*p++)) {}
+    }
+    name = layout->key_names_ext;
+    for (i = 0; i < ARRAY_SIZE(us_key_names_ext); i++, name++)
+    {
+        const char *p = us_key_names_ext[i].name;
+        name->vsc = us_key_names_ext[i].vsc;
+        name->pwsz = text;
+        while ((*text++ = (unsigned char)*p++)) {}
+    }
+
+    layout->tables.pCharModifiers = modifiers;
+    layout->tables.pVkToWcharTable = layout->vk_to_wchar_table;
+    layout->tables.pKeyNames = layout->key_names;
+    layout->tables.pKeyNamesExt = layout->key_names_ext;
+    layout->tables.pusVSCtoVK = layout->vsc_to_vk;
+    layout->tables.bMaxVSCtoVK = ARRAY_SIZE(us_vsc_to_vk);
+    layout->tables.pVSCtoVK_E0 = layout->vsc_to_vk_e0;
+    layout->tables.pVSCtoVK_E1 = layout->vsc_to_vk_e1;
+    layout->tables.fLocaleFlags = MAKELONG( keymap->altgr ? KLLF_ALTGR : 0, KBD_VERSION );
+    return layout;
+}
+
+/* A piece of the Mac's keyboard layout; the last one makes it the layout of the process. */
+static void handle_keymap( const struct wsd_ev_keymap *ev, const char *bytes, UINT len )
+{
+    static char *blob;        /* event thread */
+    static UINT serial, received, total;
+    struct obelisk_layout *layout, *previous;
+    struct obelisk_keymap *keymap;
+
+    if (!ev->offset)
+    {
+        free( blob );
+        blob = NULL;
+        received = 0;
+        serial = ev->serial;
+        total = ev->total;
+        if (!total || total > (1u << 20) || !(blob = malloc( total ))) return;
+    }
+    if (!blob || ev->serial != serial || ev->total != total || ev->offset != received || len > total - received)
+    {
+        WARN( "keyboard layout %u: piece at %u out of order\n", ev->serial, ev->offset );
+        return;
+    }
+    memcpy( blob + received, bytes, len );
+    if ((received += len) < total) return;
+
+    keymap = obelisk_keymap_create( blob, total, serial );
+    free( blob );
+    blob = NULL;
+    if (!keymap || !(layout = create_layout( keymap )))
+    {
+        WARN( "keyboard layout %u refused, the keys stay as they are\n", serial );
+        free( keymap );
+        return;
+    }
+    TRACE( "keyboard layout %u: %s%s%s, %u compositions\n", serial, keymap->source, keymap->iso ? ", ISO" : "",
+           keymap->altgr ? ", right Option is AltGr" : "", keymap->composition_count );
+    pthread_mutex_lock( &layout_lock );
+    previous = current_layout;
+    current_layout = layout;
+    pthread_mutex_unlock( &layout_lock );
+    if (previous)
+    {
+        HWND foreground = NtUserGetForegroundWindow();
+        DWORD pid = 0;
+        release_layout( previous );
+        /* the player picked another input source: the program with the keyboard hears of it as it does on Windows,
+         * and reads the keys' names and characters again if it keeps them */
+        if (foreground && NtUserGetWindowThread( foreground, &pid ) && pid == GetCurrentProcessId())
+            NtUserPostMessage( foreground, WM_INPUTLANGCHANGE, DEFAULT_CHARSET, (LPARAM)NtUserGetKeyboardLayout( 0 ) );
+    }
+}
+
+static const KBDTABLES *OBELISK_KbdLayerDescriptor( HKL hkl )
+{
+    struct obelisk_layout *layout = grab_layout();
+    return layout ? &layout->tables : NULL;
+}
+
+static void OBELISK_ReleaseKbdTables( const KBDTABLES *tables )
+{
+    release_layout( CONTAINING_RECORD( tables, struct obelisk_layout, tables ) );
+}
+
+/* The characters of the layout's own keys, dead keys included; win32u types the others from the tables (Return,
+ * the keypad, Ctrl with a key). The accent of a dead key waits in its thread for the next character. */
+static INT OBELISK_ToUnicodeEx( UINT virt, UINT scan, const BYTE *state, WCHAR *str, int size, UINT flags, HKL hkl )
+{
+    static __thread struct { UINT serial; WCHAR accent; } dead;
+    struct obelisk_layout *layout;
+    BOOL ctrl = state[VK_CONTROL] & 0x80, alt = state[VK_MENU] & 0x80;
+    BOOL menu = flags & 1, keep = flags & 4;
+    WCHAR none = 0, *pending = &dead.accent;
+    UINT level = 0;
+    INT ret;
+
+    if (scan & 0x8000) return -2;  /* a key going up types nothing */
+    if (ctrl && !alt) return -2;
+    if (!(layout = grab_layout())) return -2;
+    if (ctrl && alt && !layout->keymap->altgr)
+    {
+        release_layout( layout );
+        return -2;
+    }
+    if (dead.serial != layout->keymap->serial)
+    {
+        dead.serial = layout->keymap->serial;
+        dead.accent = 0;
+    }
+    if (state[VK_SHIFT] & 0x80) level |= OBELISK_LEVEL_SHIFT;
+    if (ctrl && alt) level |= OBELISK_LEVEL_ALTGR;
+    if (state[VK_CAPITAL] & 1) level |= OBELISK_LEVEL_CAPS;
+    if (menu) pending = &none;  /* a menu's accelerator: the key's character, whatever was typed before */
+    ret = obelisk_keymap_to_unicode( layout->keymap, virt, level, menu || keep, pending, str, size );
+    if (menu && ret == -1) ret = 1;
+    if (ret >= -1)
+    {
+        INT count = ret < 0 ? 1 : ret;
+        if (count < size) str[count] = 0;
+        TRACE( "vkey %#x level %u -> %d %s\n", virt, level, ret, debugstr_wn( str, min( count, size ) ) );
+    }
+    release_layout( layout );
+    return ret;
+}
+
+/***********************************************************************
  *           input
  */
-/* Mac virtual keycode -> virtual key and scan code (0x100: extended), by the key's place on a US keyboard: winemac.drv's
- * table (keyboard.c, default_map), with Command as the Windows keys and Option as Alt. */
-static const struct { WORD vk; WORD scan; } keymap[128] =
+static void send_key_input( HWND hwnd, WORD vkey, WORD scan, BOOL down )
 {
-    {'A',0x1e},{'S',0x1f},{'D',0x20},{'F',0x21},{'H',0x23},{'G',0x22},{'Z',0x2c},{'X',0x2d},          /* 0x00 */
-    {'C',0x2e},{'V',0x2f},{VK_OEM_102,0x56},{'B',0x30},{'Q',0x10},{'W',0x11},{'E',0x12},{'R',0x13},  /* 0x08 */
-    {'Y',0x15},{'T',0x14},{'1',0x02},{'2',0x03},{'3',0x04},{'4',0x05},{'6',0x07},{'5',0x06},          /* 0x10 */
-    {VK_OEM_PLUS,0x0d},{'9',0x0a},{'7',0x08},{VK_OEM_MINUS,0x0c},{'8',0x09},{'0',0x0b},{VK_OEM_6,0x1b},{'O',0x18}, /* 0x18 */
-    {'U',0x16},{VK_OEM_4,0x1a},{'I',0x17},{'P',0x19},{VK_RETURN,0x1c},{'L',0x26},{'J',0x24},{VK_OEM_7,0x28}, /* 0x20 */
-    {'K',0x25},{VK_OEM_1,0x27},{VK_OEM_5,0x2b},{VK_OEM_COMMA,0x33},{VK_OEM_2,0x35},{'N',0x31},{'M',0x32},
-    {VK_OEM_PERIOD,0x34},                                                                              /* 0x28 */
-    {VK_TAB,0x0f},{VK_SPACE,0x39},{VK_OEM_3,0x29},{VK_BACK,0x0e},{0,0},{VK_ESCAPE,0x01},{VK_RWIN,0x15c},
-    {VK_LWIN,0x15b},                                                                                   /* 0x30 */
-    {VK_LSHIFT,0x2a},{VK_CAPITAL,0x3a},{VK_LMENU,0x38},{VK_LCONTROL,0x1d},{VK_RSHIFT,0x36},{VK_RMENU,0x138},
-    {VK_RCONTROL,0x11d},{0,0} /* Fn */,                                                                 /* 0x38 */
-    {VK_F17,0x68},{VK_DECIMAL,0x53},{0,0},{VK_MULTIPLY,0x37},{0,0},{VK_ADD,0x4e},{0,0},{VK_OEM_CLEAR,0x59}, /* 0x40 */
-    {VK_VOLUME_UP,0x100},{VK_VOLUME_DOWN,0x100},{VK_VOLUME_MUTE,0x100},{VK_DIVIDE,0x135},{VK_RETURN,0x11c},
-    {0,0},{VK_SUBTRACT,0x4a},{VK_F18,0x69},                                                            /* 0x48 */
-    {VK_F19,0x6a},{VK_OEM_NEC_EQUAL,0x10d},{VK_NUMPAD0,0x52},{VK_NUMPAD1,0x4f},{VK_NUMPAD2,0x50},{VK_NUMPAD3,0x51},
-    {VK_NUMPAD4,0x4b},{VK_NUMPAD5,0x4c},                                                               /* 0x50 */
-    {VK_NUMPAD6,0x4d},{VK_NUMPAD7,0x47},{VK_F20,0x6b},{VK_NUMPAD8,0x48},{VK_NUMPAD9,0x49},{0xff,0x7d} /* JIS Yen */,
-    {0xc1,0x73} /* JIS Underscore */,{VK_SEPARATOR,0x7e} /* JIS Keypad Comma */,                        /* 0x58 */
-    {VK_F5,0x3f},{VK_F6,0x40},{VK_F7,0x41},{VK_F3,0x3d},{VK_F8,0x42},{VK_F9,0x43},{0xff,0x72} /* JIS Eisu */,
-    {VK_F11,0x57},                                                                                     /* 0x60 */
-    {VK_OEM_RESET,0x71} /* JIS Kana */,{VK_F13,0x64},{VK_F16,0x67},{VK_F14,0x65},{0,0},{VK_F10,0x44},{0,0},
-    {VK_F12,0x58},                                                                                     /* 0x68 */
-    {0,0},{VK_F15,0x66},{VK_INSERT,0x152} /* Help */,{VK_HOME,0x147},{VK_PRIOR,0x149},{VK_DELETE,0x153},
-    {VK_F4,0x3e},{VK_END,0x14f},                                                                       /* 0x70 */
-    {VK_F2,0x3c},{VK_NEXT,0x151},{VK_F1,0x3b},{VK_LEFT,0x14b},{VK_RIGHT,0x14d},{VK_DOWN,0x150},{VK_UP,0x148},
-    {0,0},                                                                                             /* 0x78 */
-};
+    INPUT input = { .type = INPUT_KEYBOARD };
+
+    input.ki.wVk = vkey;
+    input.ki.wScan = scan & 0xff;
+    if (scan & 0x100) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    if (!down) input.ki.dwFlags |= KEYEVENTF_KEYUP;
+    NtUserSendHardwareInput( hwnd, 0, &input, 0 );
+}
 
 static void send_key( HWND hwnd, const struct wsd_ev_key *ev )
 {
-    INPUT input = { .type = INPUT_KEYBOARD };
+    struct obelisk_layout *layout;
     UINT code = ev->mac_keycode;
+    BOOL down = ev->flags & WSD_KEY_DOWN, altgr = FALSE;
+    WORD vkey, scan;
 
-    /* On an ISO keyboard kVK_ISO_Section is the key left of 1 and kVK_ANSI_Grave the one right of the left Shift:
-     * each takes the other's Windows key, so that a key keeps its scan code wherever it is (winemac.drv swaps their
-     * scan codes the same way). */
-    if ((ev->flags & WSD_KEY_ISO) && (code == 0x0a || code == 0x32)) code ^= 0x0a ^ 0x32;
-    if (code >= ARRAY_SIZE(keymap) || !keymap[code].vk)
+    if (code >= OBELISK_KEYS)
     {
         TRACE( "unmapped mac keycode %#x\n", ev->mac_keycode );
         return;
     }
-    input.ki.wVk = keymap[code].vk;
-    input.ki.wScan = keymap[code].scan & 0xff;
-    if (keymap[code].scan & 0x100) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-    if (!(ev->flags & WSD_KEY_DOWN)) input.ki.dwFlags |= KEYEVENTF_KEYUP;
-    TRACE( "hwnd %p kvk %#x vk %#x flags %#x\n", hwnd, ev->mac_keycode, input.ki.wVk, input.ki.dwFlags );
-    NtUserSendHardwareInput( hwnd, 0, &input, 0 );
+    /* The virtual key is the one the Mac's layout gives the key (A on the key that types "a"), and the scan code
+     * the one of the key's place, both as the layout's tables tell them to the program (MapVirtualKey): wsd reads
+     * the layout again for the keyboard a key comes from before it sends the key. */
+    if ((layout = grab_layout()))
+    {
+        vkey = layout->keymap->vkey[code];
+        scan = layout->keymap->scan[code];
+        altgr = layout->keymap->altgr;
+        release_layout( layout );
+    }
+    else
+    {
+        /* Without a layout (a wsd that sends none), the key of its place on a US keyboard. On an ISO keyboard
+         * kVK_ISO_Section is the key left of 1 and kVK_ANSI_Grave the one right of the left Shift: each takes the
+         * other's Windows key, so that a key keeps its scan code wherever it is (winemac.drv swaps their scan codes
+         * the same way). */
+        if ((ev->flags & WSD_KEY_ISO) && (code == 0x0a || code == 0x32)) code ^= 0x0a ^ 0x32;
+        vkey = obelisk_default_keys[code].vkey;
+        scan = obelisk_default_keys[code].scan;
+    }
+    if (!vkey)
+    {
+        TRACE( "unmapped mac keycode %#x\n", ev->mac_keycode );
+        return;
+    }
+    TRACE( "hwnd %p kvk %#x vk %#x scan %#x %s\n", hwnd, ev->mac_keycode, vkey, scan, down ? "down" : "up" );
+    /* AltGr: where the layout types ASCII with Option, the right Option key is the AltGr of a PC keyboard, which
+     * Windows sends as the left Control then the right Alt. */
+    if (ev->mac_keycode == 0x3d /* kVK_RightOption */)
+    {
+        if (down && altgr && !altgr_control)
+        {
+            altgr_control = TRUE;
+            send_key_input( hwnd, VK_LCONTROL, 0x1d, TRUE );
+        }
+        send_key_input( hwnd, vkey, scan, down );
+        if (!down && altgr_control)
+        {
+            altgr_control = FALSE;
+            send_key_input( hwnd, VK_LCONTROL, 0x1d, FALSE );
+        }
+        return;
+    }
+    send_key_input( hwnd, vkey, scan, down );
 }
 
 static void send_mouse( HWND hwnd, DWORD flags, int x, int y, DWORD data )
@@ -1145,7 +1601,7 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     RECT visible = { 0 };
 
     if (hdr->type != WSD_EV_RELEASE && hdr->type != WSD_EV_PRESENTED && hdr->type != WSD_EV_ERROR &&
-        hdr->type != WSD_EV_DISPLAY && hdr->len >= 4)
+        hdr->type != WSD_EV_DISPLAY && hdr->type != WSD_EV_KEYMAP && hdr->len >= 4)
     {
         pthread_mutex_lock( &win_lock );
         if ((win = get_win_by_id( w->window_id )))
@@ -1344,6 +1800,12 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
         if (pid == GetCurrentProcessId()) NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
         break;
     }
+    case WSD_EV_KEYMAP:
+    {
+        const struct wsd_ev_keymap *ev = (const void *)payload;
+        if (hdr->len >= sizeof(*ev)) handle_keymap( ev, payload + sizeof(*ev), hdr->len - sizeof(*ev) );
+        break;
+    }
     case WSD_EV_ERROR:
     {
         const struct wsd_ev_error *ev = (const void *)payload;
@@ -1458,10 +1920,13 @@ static const struct user_driver_funcs obeliskdrv_funcs =
     .pDestroyCursorIcon = OBELISK_DestroyCursorIcon,
     .pDestroyWindow = OBELISK_DestroyWindow,
     .pGetWindowStyleMasks = OBELISK_GetWindowStyleMasks,
+    .pKbdLayerDescriptor = OBELISK_KbdLayerDescriptor,
+    .pReleaseKbdTables = OBELISK_ReleaseKbdTables,
     .pSetCursor = OBELISK_SetCursor,
     .pSetCursorPos = OBELISK_SetCursorPos,
     .pSetWindowText = OBELISK_SetWindowText,
     .pSystemParametersInfo = OBELISK_SystemParametersInfo,
+    .pToUnicodeEx = OBELISK_ToUnicodeEx,
     .pUpdateDisplayDevices = OBELISK_UpdateDisplayDevices,
     .pWindowMessage = OBELISK_WindowMessage,
     .pWindowPosChanged = OBELISK_WindowPosChanged,
